@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, ConfigurationError, ServerSelectionTimeoutError
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
@@ -9,12 +9,19 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from gridfs import GridFS
-from io import BytesIO
-
-
+import io
+from fastapi.responses import StreamingResponse
+from bson import ObjectId
+import logging
+import urllib.parse
+import httpx
+import asyncio
+import sys
 
 app = FastAPI()  # Instance of FastAPI
 security = HTTPBearer()
+logging.basicConfig(level=logging.INFO)
+
 
 
 load_dotenv()  # Load environment variables from .env file
@@ -30,28 +37,50 @@ if not MONGO_DB:
 
         
 client = MongoClient(CONNECTION_STRING)
-users_collection = None
-data_collection = None
 db = client[MONGO_DB]  # Get the database
+users_collection = db["users"]  # Access collections
+data_collection = db["data"]
 fs = GridFS(db)
-
-
-
 
 async def connection_mongodb():
     global client, db, users_collection, data_collection
     try:
+        client = MongoClient(CONNECTION_STRING)
         client.server_info()  # Trigger a call to check if the connection is established
-        
-        users_collection = db["users"]  # Access collections
-        data_collection = db["data"]
+
     except ConnectionFailure:
         raise HTTPException(status_code=500, detail="Could not connect to MongoDB")
+    
+
+async def ping_main():
+    server_port = local_port()
+
+    while True:
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post('http://localhost:8000/ping', json={"server_port": server_port})
+                print(response.text)
+            except httpx.HTTPError as exc:
+                print(f"HTTP error occurred: {exc}")
+            except Exception as exc:
+                print(f"Error occurred: {exc}")
+        await asyncio.sleep(3) 
+
+def local_port():
+    if "--port" in sys.argv: 
+        index = sys.argv.index("--port")
+        port = int(sys.argv[index + 1])
+        print(f"This is port: {port}")
+    return port 
+
+
+
 
 @app.on_event("startup")
 async def startup_event():
     await connection_mongodb()
     print("Connected to MongoDB")
+    asyncio.create_task(ping_main())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -139,26 +168,6 @@ async def login(userlogin: UserLogin) -> dict:
     
     return {"access_token": access_token, "token_type": "bearer"}
 
-async def store_pdf(file: UploadFile, user_email: str) -> str:
-    try:
-        pdf_data = await file.read()
-        pdf_id = fs.put(pdf_data, filename=file.filename, metadata={"uploaded_by": user_email})
-        return str(pdf_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to upload PDF: {str(e)}")
-
-async def retrieve_pdf(pdf_id: str) -> dict:
-    try:
-        stored_pdf = fs.get(pdf_id)
-        return {
-            "filename": stored_pdf.filename,
-            "content": stored_pdf.read(),
-            "content-type": "application/pdf"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"PDF not found: {str(e)}")
-
-
 @app.post("/register")
 async def register_user(user:User):
     return await register(user)
@@ -168,18 +177,57 @@ async def login_user(user:UserLogin):
     return await login(user)
 
 
-@app.post("/upload_pdf")
-async def upload_pdf(file: UploadFile = File(...), token: dict = Depends(verify_token)):
-    pdf_id = await store_pdf(file, token["email"])
-    return {"message": "PDF uploaded successfully", "pdf_id": pdf_id}
+async def upload_pdf(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Invalid file type. Only PDFs are allowed.")
+    
+    try:
+        pdf_content = await file.read()
+        pdf_data = {
+            "file_name": file.filename,
+            "file_content": pdf_content,
+            "content_type": file.content_type
+        }
+        pdf_id = data_collection.insert_one(pdf_data).inserted_id
+        return {"file_id": str(pdf_id), "file_name": file.filename}
+    except Exception as e:
+        logging.error(f"Error uploading PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload PDF: {e}")
 
-@app.get("/download_pdf/{pdf_id}")
-async def download_pdf(pdf_id: str, token: dict = Depends(verify_token)):
-    pdf_info = await retrieve_pdf(pdf_id)
-    return {
-        "filename": pdf_info["filename"],
-        "content": pdf_info["content"],
-        "content-type": pdf_info["content-type"]
-    }
+@app.post("/upload")
+async def upload_pdf_to_db(file: UploadFile = File(...), credentials: HTTPAuthorizationCredentials = Depends(verify_token)):
+    return await upload_pdf(file)
 
 
+
+@app.get("/download/{file_id}")
+async def download_pdf(file_id: str, credentials: HTTPAuthorizationCredentials = Depends(verify_token)):
+    try:
+        file_data = data_collection.find_one({"_id": ObjectId(file_id)})
+        if file_data is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Encode filename correctly for HTTP headers
+        encoded_filename = urllib.parse.quote(file_data['file_name'])
+        
+        return StreamingResponse(
+            io.BytesIO(file_data["file_content"]),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+            }
+        )
+    except Exception as e:
+        logging.error(f"Error downloading PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"File not found: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        logging.info("Pinging MongoDB server...")
+        client.server_info()  # Trigger a call to check if the connection is established
+        logging.info("MongoDB connection established successfully.")
+    except (ConnectionFailure, ConfigurationError, ServerSelectionTimeoutError) as e:
+        logging.error(f"Could not connect to MongoDB: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not connect to MongoDB: {e}")
