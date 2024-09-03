@@ -4,9 +4,23 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import time
 import random
 import httpx
+from pymongo import MongoClient
+import mongo_connection
 
 app = FastAPI()
 bearer_scheme = HTTPBearer()
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this to the actual domains you want to allow
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client,db,users_collection,data_collection = mongo_connection.connectToMongoDB()
 
 WORKERS = {}
 server_counter = 0
@@ -82,6 +96,7 @@ async def register(user: User):
 
         async with httpx.AsyncClient() as client:
             response = await client.post(f"http://localhost:{server_port}/register", json=user.dict())
+            print(response)
             response.raise_for_status()
             return response.json()
 

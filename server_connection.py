@@ -17,69 +17,53 @@ import urllib.parse
 import httpx
 import asyncio
 import sys
+import mongo_connection
 
 app = FastAPI()  # Instance of FastAPI
 security = HTTPBearer()
 logging.basicConfig(level=logging.INFO)
 
+from fastapi.middleware.cors import CORSMiddleware
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this to the actual domains you want to allow
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-load_dotenv()  # Load environment variables from .env file
+#load_dotenv()  # Load environment variables from .env file
 
-CONNECTION_STRING = os.getenv("CONNECTION_STRING")  # Get MongoDB connection string from environment
-MONGO_DB = os.getenv("MONGO_DB")  # Get the database name from environment
-
-if not CONNECTION_STRING:
-    raise ValueError("CONNECTION_STRING environment variable not set")
-
-if not MONGO_DB:
-    raise ValueError("Base1 environment variable not set")
-
-        
-client = MongoClient(CONNECTION_STRING)
-db = client[MONGO_DB]  # Get the database
-users_collection = db["users"]  # Access collections
-data_collection = db["data"]
-fs = GridFS(db)
-
-async def connection_mongodb():
-    global client, db, users_collection, data_collection
-    try:
-        client = MongoClient(CONNECTION_STRING)
-        client.server_info()  # Trigger a call to check if the connection is established
-
-    except ConnectionFailure:
-        raise HTTPException(status_code=500, detail="Could not connect to MongoDB")
+client,db,users_collection,data_collection = mongo_connection.connectToMongoDB()
     
+fs = GridFS(db)
 
 async def ping_main():
     server_port = local_port()
+    print(server_port)
 
     while True:
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.post('http://localhost:8000/ping', json={"server_port": server_port})
+                response = await client.post(f"http://localhost:5000/ping", json={"server_port": server_port})
                 print(response.text)
             except httpx.HTTPError as exc:
                 print(f"HTTP error occurred: {exc}")
             except Exception as exc:
                 print(f"Error occurred: {exc}")
-        await asyncio.sleep(3) 
+        await asyncio.sleep(3)
 
 def local_port():
     if "--port" in sys.argv: 
         index = sys.argv.index("--port")
         port = int(sys.argv[index + 1])
         print(f"This is port: {port}")
-    return port 
-
-
-
+        return port
+    raise ValueError("Port not specified in command line arguments")
 
 @app.on_event("startup")
 async def startup_event():
-    await connection_mongodb()
-    print("Connected to MongoDB")
     asyncio.create_task(ping_main())
 
 @app.on_event("shutdown")
@@ -226,7 +210,7 @@ async def download_pdf(file_id: str, credentials: HTTPAuthorizationCredentials =
 async def startup_event():
     try:
         logging.info("Pinging MongoDB server...")
-        client.server_info()  # Trigger a call to check if the connection is established
+        #client.server_info()  # Trigger a call to check if the connection is established
         logging.info("MongoDB connection established successfully.")
     except (ConnectionFailure, ConfigurationError, ServerSelectionTimeoutError) as e:
         logging.error(f"Could not connect to MongoDB: {e}")
